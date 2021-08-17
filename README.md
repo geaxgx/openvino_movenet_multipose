@@ -10,6 +10,8 @@ locations](https://github.com/tensorflow/tfjs-models/tree/master/pose-detection#
 
 ![Demo](img/dance.gif)
 
+*Full video demo [here.](https://youtu.be/ndy18jNcOC0)*
+
 For MoveNet Single Pose, please visit : [openvino_movenet](https://github.com/geaxgx/openvino_movenet)
 
 
@@ -63,7 +65,7 @@ optional arguments:
 |*space*|Pause
 |b|Show/hide bounding boxes|
 |f|Show/hide FPS|
-|
+
 
 
 ## The models 
@@ -83,7 +85,7 @@ The test below has been run on a CPU i7700k.
 |256x320|44.1|[<img src="img/street_256x320.jpg" alt="256x320" width="300"/>](img/street_256x320.jpg)|
 |480x640|14.8|[<img src="img/street_480x640.jpg" alt="480x640" width="300"/>](img/street_480x640.jpg)|
 |736x1280|4.5|[<img src="img/street_736x1280.jpg" alt="736x1280" width="300"/>](img/street_736x1280.jpg)|
-|
+
 
 ## Credits
 * [Google Tensorflow Hub](https://tfhub.dev/google/movenet/multipose/lightning/1)
