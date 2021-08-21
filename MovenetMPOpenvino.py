@@ -6,6 +6,7 @@ from FPS import FPS, now
 import argparse
 import os
 from openvino.inference_engine import IENetwork, IECore
+from Tracker import TrackerIoU, TrackerOKS, TRACK_COLORS
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,7 +44,7 @@ LINES_BODY = [[4,2],[2,0],[0,1],[1,3],
             [12,14],[14,16],[11,13],[13,15]]
 
 class Body:
-    def __init__(self, score, xmin, ymin, xmax, ymax, keypoints_score=None, keypoints_norm=None):
+    def __init__(self, score, xmin, ymin, xmax, ymax, keypoints_score, keypoints, keypoints_norm):
         self.score = score # global score
         # xmin, ymin, xmax, ymax : bounding box
         self.xmin = xmin
@@ -51,16 +52,19 @@ class Body:
         self.xmax = xmax
         self.ymax = ymax
         self.keypoints_score = keypoints_score# scores of the keypoints
-        self.keypoints_norm = keypoints_norm # keypoints normalized ([0,1]) coordinates (x,y) in the squared input image
-        self.keypoints = None # keypoints coordinates (x,y) in pixels in the source image
+        self.keypoints_norm = keypoints_norm # keypoints normalized ([0,1]) coordinates (x,y) in the input image
+        self.keypoints = keypoints # keypoints coordinates (x,y) in pixels in the input image
 
     def print(self):
         attrs = vars(self)
         print('\n'.join("%s: %s" % item for item in attrs.items()))
 
+    def str_bbox(self):
+        return f"xmin={self.xmin} xmax={self.xmax} ymin={self.ymin} ymax={self.ymax}"
+
 # Padding (all values are in pixel) :
 # w (resp. h): horizontal (resp. vertical) padding on the source image to make its ratio same as Movenet model input. 
-#               The padding is done on both side of the image.
+#               The padding is done on one side (bottom or right) of the image.
 # padded_w (resp. padded_h): width (resp. height) of the image after padding
 Padding = namedtuple('Padding', ['w', 'h', 'padded_w',  'padded_h'])
 
@@ -68,10 +72,20 @@ class MovenetMPOpenvino:
     def __init__(self, input_src=None,
                 xml=DEFAULT_MODEL, 
                 device="CPU",
+                tracking=False,
                 score_thresh=0.2,
                 output=None):
         
         self.score_thresh = score_thresh
+        self.tracking = tracking
+        if tracking is None:
+            self.tracking = False
+        elif tracking == "iou":
+            self.tracking = True
+            self.tracker = TrackerIoU()
+        elif tracking == "oks":
+            self.tracking = True
+            self.tracker = TrackerOKS()
          
         if input_src.endswith('.jpg') or input_src.endswith('.png') :
             self.input_type= "image"
@@ -106,13 +120,16 @@ class MovenetMPOpenvino:
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
                 self.output = cv2.VideoWriter(output,fourcc,self.video_fps,(self.img_w, self.img_h)) 
 
-        # Defines the padding
+        # Define the padding
+        # Note we don't center the source image. The padding is applied
+        # on the bottom or right side. That simplifies a bit the calculation
+        # when depadding
         if self.img_w / self.img_h > self.pd_w / self.pd_h:
-            pad_h = int((self.img_w * self.pd_h / self.pd_w - self.img_h) / 2)
-            self.padding = Padding(0, pad_h, self.img_w, self.img_h + 2*pad_h)
+            pad_h = int(self.img_w * self.pd_h / self.pd_w - self.img_h)
+            self.padding = Padding(0, pad_h, self.img_w, self.img_h + pad_h)
         else:
-            pad_w = int((self.img_h * self.pd_w / self.pd_h - self.img_w) / 2)
-            self.padding = Padding(pad_w, 0, self.img_w + 2*pad_w, self.img_h)
+            pad_w = int(self.img_h * self.pd_w / self.pd_h - self.img_w)
+            self.padding = Padding(pad_w, 0, self.img_w + pad_w, self.img_h)
         print("Padding:", self.padding)
         
     def load_model(self, xml_path, device):
@@ -147,9 +164,9 @@ class MovenetMPOpenvino:
         """ Pad and resize the image to prepare for the model input."""
 
         padded = cv2.copyMakeBorder(frame, 
-                                        self.padding.h, 
+                                        0, 
                                         self.padding.h,
-                                        self.padding.w, 
+                                        0, 
                                         self.padding.w,
                                         cv2.BORDER_CONSTANT)
 
@@ -165,18 +182,28 @@ class MovenetMPOpenvino:
             bbox = result[i][51:55].reshape(2,2)          
             score = result[i][55]
             if score > self.score_thresh:
-                ymin, xmin, ymax, xmax = ([-self.padding.h, -self.padding.w] + bbox * [self.padding.padded_h, self.padding.padded_w]).flatten().astype(np.int)
-                body = Body(score=score, xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, keypoints_score=kps[:,2], keypoints_norm=kps[:,[1,0]])
-                body.keypoints = (np.array([-self.padding.w, -self.padding.h]) + body.keypoints_norm * np.array([self.padding.padded_w, self.padding.padded_h])).astype(np.int)
+                ymin, xmin, ymax, xmax = (bbox * [self.padding.padded_h, self.padding.padded_w]).flatten().astype(np.int)
+                kp_xy =kps[:,[1,0]]
+                keypoints = kp_xy * np.array([self.padding.padded_w, self.padding.padded_h])
+
+                body = Body(score=score, xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, 
+                            keypoints_score = kps[:,2], 
+                            keypoints = keypoints.astype(np.int),
+                            keypoints_norm = keypoints / np.array([self.img_w, self.img_h]))
                 bodies.append(body)
         return bodies
         
 
     def pd_render(self, frame, bodies):
-
+        thickness = 3 
+        color_skeleton = (255, 180, 90)
+        color_box = (0,255,255)
         for body in bodies:
+            if self.tracking:
+                color_skeleton = color_box = TRACK_COLORS[body.track_id % len(TRACK_COLORS)]
+                
             lines = [np.array([body.keypoints[point] for point in line]) for line in LINES_BODY if body.keypoints_score[line[0]] > self.score_thresh and body.keypoints_score[line[1]] > self.score_thresh]
-            cv2.polylines(frame, lines, False, (255, 180, 90), 2, cv2.LINE_AA)
+            cv2.polylines(frame, lines, False, color_skeleton, 2, cv2.LINE_AA)
             
             for i,x_y in enumerate(body.keypoints):
                 if body.keypoints_score[i] > self.score_thresh:
@@ -189,8 +216,13 @@ class MovenetMPOpenvino:
                     cv2.circle(frame, (x_y[0], x_y[1]), 4, color, -11)
 
             if self.show_bounding_box:
-                cv2.rectangle(frame, (body.xmin, body.ymin), (body.xmax, body.ymax), (0,255,255), 2)
+                cv2.rectangle(frame, (body.xmin, body.ymin), (body.xmax, body.ymax), color_box, thickness)
 
+            if self.tracking:
+                # Display track_id at the center of the bounding box
+                x = (body.xmin + body.xmax) // 2
+                y = (body.ymin + body.ymax) // 2
+                cv2.putText(frame, str(body.track_id), (x,y), cv2.FONT_HERSHEY_PLAIN, 4, color_box, 3)
                 
     def run(self):
 
@@ -215,6 +247,8 @@ class MovenetMPOpenvino:
             inference = self.pd_exec_net.infer(inputs={self.pd_input_blob: frame_nn})
             glob_pd_rtrip_time += now() - pd_rtrip_time
             bodies = self.pd_postprocess(inference)
+            if self.tracking:
+                bodies = self.tracker.apply(bodies, now())
             self.pd_render(frame, bodies)
             nb_pd_inferences += 1
 
@@ -264,7 +298,9 @@ if __name__ == "__main__":
                         help="Path to an .xml file for model")
     parser.add_argument("-r", "--res", default="256x256", choices=["192x192", "192x256", "256x256", "256x320", "320x320", "480x640", "736x1280"])
     # parser.add_argument("-d", "--device", default='CPU', type=str,
-    #                     help="Target device to run the model (default=%(default)s)")  
+    #                     help="Target device to run the model (default=%(default)s)") 
+    parser.add_argument("-t", "--tracking", choices=["iou", "oks"],
+                        help="Enable tracking and specify method")
     parser.add_argument("-s", "--score_threshold", default=0.2, type=float,
                         help="Confidence score (default=%(default)f)")                     
     parser.add_argument("-o","--output",
@@ -281,6 +317,7 @@ if __name__ == "__main__":
     pd = MovenetMPOpenvino(input_src=args.input, 
                     xml=args.xml,
                     # device=args.device, 
+                    tracking=args.tracking,
                     score_thresh=args.score_threshold,
                     output=args.output)
     pd.run()
